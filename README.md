@@ -27,7 +27,7 @@ This is a **simplified demonstration** of a real-time people counting system con
 
 ### Demo Technologies
 - **Language**: Python 3.8+
-- **Object Detection**: YOLOX (pre-trained on COCO dataset)
+- **Object Detection**: [YOLOX](https://github.com/Megvii-BaseDetection/YOLOX) (pre-trained on COCO dataset)
 - **Video Processing**: OpenCV
 - **Tracking**: Centroid-based tracker or norfair
 - **Visualization**: OpenCV GUI / Streamlit
@@ -59,3 +59,5 @@ This demo is for educational purposes. The production system is proprietary.
 ## 🙏 Acknowledgments
 
 This demo was created to showcase concepts from a real-world deployment without exposing sensitive IP or violating NDAs.
+
+**Object Detection**: This project uses [YOLOX](https://github.com/Megvii-BaseDetection/YOLOX) by Megvii Technology for real-time object detection.
