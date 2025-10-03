@@ -1,27 +1,33 @@
 """
-Video processing pipeline: read → detect → display.
+Video processing pipeline: read → detect → track → count → display.
 Simple synchronous pipeline for demo purposes.
 """
 
+import time
+from pathlib import Path
+from typing import Callable, Optional, Tuple
+
 import cv2
 import numpy as np
-import time
-from typing import Optional, Callable
-from pathlib import Path
 
+from src.counter.line_counter import LineCounter
+from src.detector.yolox_detector import COCO_CLASSES, YOLOXDetector
+from src.tracker.centroid_tracker import CentroidTracker
 from src.video.video_reader import VideoReader, VideoWriter
-from src.detector.yolox_detector import YOLOXDetector, COCO_CLASSES
 
 
 class VideoProcessingPipeline:
     """
-    Simple video processing pipeline.
-    Reads frames, runs detection, and displays/saves results.
+    Simple video processing pipeline with tracking and counting.
+    Reads frames, runs detection, tracks objects, counts crossings, and displays/saves results.
     """
 
     def __init__(
         self,
         detector: YOLOXDetector,
+        enable_tracking: bool = True,
+        enable_counting: bool = True,
+        counting_line: Optional[Tuple[Tuple[int, int], Tuple[int, int]]] = None,
         show_display: bool = True,
         save_output: bool = False,
         output_dir: str = "output/videos"
@@ -31,14 +37,24 @@ class VideoProcessingPipeline:
 
         Args:
             detector: YOLOX detector instance
+            enable_tracking: Enable object tracking
+            enable_counting: Enable people counting
+            counting_line: Line for counting ((x1,y1), (x2,y2)). If None, will be auto-set
             show_display: Whether to show live display
             save_output: Whether to save output video
             output_dir: Directory for output videos
         """
         self.detector = detector
+        self.enable_tracking = enable_tracking
+        self.enable_counting = enable_counting
+        self.counting_line = counting_line
         self.show_display = show_display
         self.save_output = save_output
         self.output_dir = Path(output_dir)
+
+        # Initialize tracker and counter
+        self.tracker = CentroidTracker(max_disappeared=30, max_distance=100) if enable_tracking else None
+        self.counter = None  # Will be initialized when video dimensions are known
 
         # Statistics
         self.total_frames = 0
@@ -103,13 +119,121 @@ class VideoProcessingPipeline:
                 )
 
         return frame_draw
+    
+    def draw_tracked_objects(
+        self,
+        frame: np.ndarray,
+        tracked_objects: dict,
+        show_labels: bool = True
+    ) -> np.ndarray:
+        """
+        Draw tracked objects with IDs on frame.
+
+        Args:
+            frame: Input frame
+            tracked_objects: Dictionary mapping object_id -> (centroid, bbox)
+            show_labels: Whether to show labels
+
+        Returns:
+            Frame with drawn tracked objects
+        """
+        frame_draw = frame.copy()
+
+        for object_id, (centroid, bbox) in tracked_objects.items():
+            x1, y1, x2, y2 = bbox
+            x1, y1, x2, y2 = int(x1), int(y1), int(x2), int(y2)
+            cx, cy = int(centroid[0]), int(centroid[1])
+
+            # Color based on ID (cycling through colors)
+            colors = [(0, 255, 0), (255, 0, 0), (0, 0, 255), (255, 255, 0), (255, 0, 255), (0, 255, 255)]
+            color = colors[object_id % len(colors)]
+
+            # Draw rectangle
+            cv2.rectangle(frame_draw, (x1, y1), (x2, y2), color, 2)
+
+            # Draw centroid
+            cv2.circle(frame_draw, (cx, cy), 4, color, -1)
+
+            if show_labels:
+                # Draw ID label
+                label = f"ID: {object_id}"
+                (text_width, text_height), baseline = cv2.getTextSize(
+                    label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2
+                )
+                cv2.rectangle(
+                    frame_draw,
+                    (x1, y1 - text_height - baseline - 4),
+                    (x1 + text_width, y1),
+                    color,
+                    -1
+                )
+                cv2.putText(
+                    frame_draw,
+                    label,
+                    (x1, y1 - baseline - 2),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.6,
+                    (255, 255, 255),
+                    2
+                )
+
+        return frame_draw
+
+    def draw_counting_line(
+        self,
+        frame: np.ndarray,
+        counts: Optional[dict] = None
+    ) -> np.ndarray:
+        """
+        Draw counting line and counts on frame.
+
+        Args:
+            frame: Input frame
+            counts: Count dictionary (optional)
+
+        Returns:
+            Frame with counting line drawn
+        """
+        if self.counter is None:
+            return frame
+
+        frame_draw = frame.copy()
+
+        # Draw line
+        cv2.line(
+            frame_draw,
+            tuple(self.counter.line_start.astype(int)),
+            tuple(self.counter.line_end.astype(int)),
+            (0, 255, 255),
+            3
+        )
+
+        # Draw counts if provided
+        if counts is not None:
+            labels = self.counter.direction_labels
+            text_y = int(self.counter.line_start[1]) - 30
+
+            for i, (label, count) in enumerate(counts.items()):
+                text = f"{label.upper()}: {count}"
+                cv2.putText(
+                    frame_draw,
+                    text,
+                    (int(self.counter.line_start[0]) + i * 150, text_y),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.8,
+                    (0, 255, 255),
+                    2
+                )
+
+        return frame_draw
 
     def draw_info(
         self,
         frame: np.ndarray,
         frame_number: int,
         num_detections: int,
-        fps: float
+        fps: float,
+        counts: Optional[dict] = None
     ) -> np.ndarray:
         """
         Draw processing info on frame.
@@ -119,13 +243,15 @@ class VideoProcessingPipeline:
             frame_number: Current frame number
             num_detections: Number of detections
             fps: Processing FPS
+            counts: Optional counting statistics
 
         Returns:
             Frame with info overlay
         """
         # Create semi-transparent overlay
         overlay = frame.copy()
-        cv2.rectangle(overlay, (10, 10), (400, 120), (0, 0, 0), -1)
+        box_height = 160 if counts else 120
+        cv2.rectangle(overlay, (10, 10), (450, box_height), (0, 0, 0), -1)
         frame_with_overlay = cv2.addWeighted(frame, 0.7, overlay, 0.3, 0)
 
         # Draw text
@@ -161,6 +287,20 @@ class VideoProcessingPipeline:
             (0, 255, 255),
             2
         )
+
+        # Draw counting info if available
+        if counts:
+            y_offset += 30
+            count_text = " | ".join([f"{k.upper()}: {v}" for k, v in counts.items()])
+            cv2.putText(
+                frame_with_overlay,
+                f"Count: {count_text}",
+                (20, y_offset),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.7,
+                (255, 165, 0),
+                2
+            )
 
         return frame_with_overlay
 
